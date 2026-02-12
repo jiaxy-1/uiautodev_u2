@@ -1,0 +1,22 @@
+{
+  "date": "Wed, 11 Feb 2026 12:31:59 GMT",
+  "content-type": "font/woff2",
+  "content-length": "30180",
+  "connection": "keep-alive",
+  "accept-ranges": "bytes",
+  "etag": "\"dg6kqj41eoe8nac\"",
+  "last-modified": "Wed, 04 Feb 2026 23:42:26 GMT",
+  "server": "cloudflare",
+  "vary": "Accept-Encoding",
+  "x-content-type-options": "nosniff",
+  "x-railway-edge": "railway/us-east4-eqdc4a",
+  "x-railway-request-id": "dw7heN0mRJyJ33WQAax-fw",
+  "nel": "{\"report_to\":\"cf-nel\",\"success_fraction\":0.0,\"max_age\":604800}",
+  "age": "31664",
+  "cache-control": "max-age=86400",
+  "cf-cache-status": "HIT",
+  "report-to": "{\"group\":\"cf-nel\",\"max_age\":604800,\"endpoints\":[{\"url\":\"https://a.nel.cloudflare.com/report/v4?s=AdkH9grgArK7CtaJ9tbtwS8I4op0TCC2wmNTFSuV0EcS2qtsPOgXlk4zz0MstleGLzDGI4kjdmQ2fAAloNJgTGnySjyXRqZQ\"}]}",
+  "cf-ray": "9cc3ddce0fb70939-IAD",
+  "alt-svc": "h3=\":443\"; ma=86400",
+  "cache-status": "HIT"
+}
