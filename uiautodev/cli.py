@@ -24,7 +24,6 @@ from rich.logging import RichHandler
 
 from uiautodev import __version__, command_proxy
 from uiautodev.command_types import Command
-from uiautodev.common import get_webpage_url
 from uiautodev.provider import AndroidProvider, BaseProvider, IOSProvider
 from uiautodev.utils.common import convert_params_to_model, print_json
 
@@ -178,7 +177,7 @@ def server(port: int, host: str, reload: bool, force: bool, no_browser: bool, of
         logger.info("offline mode enabled, cache dir: %s, server url: %s", proxy.cache_dir, proxy.base_url)
 
     if not no_browser:
-        th = threading.Thread(target=open_browser_when_server_start, args=(f"http://{host}:{port}", offline))
+        th = threading.Thread(target=open_browser_when_server_start, args=(f"http://{host}:{port}",))
         th.daemon = True
         th.start()
     uvicorn.run("uiautodev.app:app", host=host, port=port, reload=reload, use_colors=use_color)
@@ -192,7 +191,7 @@ def shutdown(port: int):
         pass
 
 
-def open_browser_when_server_start(local_server_url: str, offline: bool = False):
+def open_browser_when_server_start(local_server_url: str):
     deadline = time.time() + 10
     while time.time() < deadline:
         try:
@@ -201,7 +200,7 @@ def open_browser_when_server_start(local_server_url: str, offline: bool = False)
         except Exception as e:
             time.sleep(0.5)
     import webbrowser
-    web_url = get_webpage_url(local_server_url if offline else None)
+    web_url = f"{local_server_url.rstrip('/')}/inspector"
     logger.info("open browser: %s", web_url)
     webbrowser.open(web_url)
 
