@@ -169,7 +169,12 @@ def server(port: int, host: str, reload: bool, force: bool, no_browser: bool, of
     proxy.base_url = server_url
 
     if offline:
-        proxy.cache_dir.mkdir(parents=True, exist_ok=True)
+        os.environ["UIAUTODEV_OFFLINE"] = "true"
+        from uiautodev.utils.envutils import Environment
+        Environment.UIAUTODEV_OFFLINE = True
+        
+        if not proxy.cache_dir.exists():
+            proxy.cache_dir.mkdir(parents=True, exist_ok=True)
         logger.info("offline mode enabled, cache dir: %s, server url: %s", proxy.cache_dir, proxy.base_url)
 
     if not no_browser:

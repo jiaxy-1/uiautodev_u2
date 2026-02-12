@@ -11,9 +11,11 @@ from fastapi import APIRouter, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import Response, StreamingResponse
 from starlette.background import BackgroundTask
 
+from uiautodev.utils.envutils import Environment
+
 logger = logging.getLogger(__name__)
 router = APIRouter()
-cache_dir = Path("./cache")
+cache_dir = Path(__file__).parent.parent / "static" / "cache"
 base_url = 'https://uiauto.dev'
 
 @router.get("/")
@@ -46,9 +48,11 @@ class HTTPCache:
     async def proxy_request(self, request: Request, update_cache: bool = False):
         response = await self.get_cached_response(request)
         if not response:
+            if Environment.UIAUTODEV_OFFLINE:
+                return Response(status_code=404, content="Offline mode: cache miss")
             response = await self.proxy_and_save_response(request)
             return response
-        if update_cache:
+        if update_cache and not Environment.UIAUTODEV_OFFLINE:
             # async update cache in background
             asyncio.create_task(self.update_cache(request))
         return response

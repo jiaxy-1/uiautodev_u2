@@ -1,0 +1,1945 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>UI Inspector (React)</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script crossorigin src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+</head>
+<body class="h-screen w-screen overflow-hidden bg-slate-100">
+  <div id="root" class="h-full w-full"></div>
+
+  <script type="text/babel">
+    const { useEffect, useMemo, useRef, useState, useCallback } = React;
+
+    const MIN_PCT = 15;
+    const RESIZER_PX = 6;
+
+    function clamp(v, min, max) {
+      return Math.max(min, Math.min(max, v));
+    }
+
+    function fitContain(containerW, containerH, imageW, imageH) {
+      if (!containerW || !containerH || !imageW || !imageH) {
+        return { scale: 1, drawW: 0, drawH: 0, offsetX: 0, offsetY: 0 };
+      }
+      const scale = Math.min(containerW / imageW, containerH / imageH);
+      const drawW = imageW * scale;
+      const drawH = imageH * scale;
+      const offsetX = (containerW - drawW) / 2;
+      const offsetY = (containerH - drawH) / 2;
+      return { scale, drawW, drawH, offsetX, offsetY };
+    }
+
+    const LEGACY_KEYS = new Set([
+      "type", "id", "desc", "index",
+      "content_desc", "class_name", "classname",
+      "resourceid", "desc_contains", "desc_matches", "desc_starts_with",
+    ]);
+
+    const STATE_KEYS = [
+      "clickable",
+      "enabled",
+      "checked",
+      "selected",
+      "focused",
+      "scrollable",
+      "longClickable",
+      "long_clickable",
+    ];
+
+    const SEMANTIC_TYPE_MAP = {
+      "android.widget.ImageView": "image",
+      "android.widget.Button": "button",
+      "android.widget.TextView": "text",
+      "android.widget.EditText": "input",
+      "android.view.View": "view",
+    };
+
+    const REVERSE_SEMANTIC_TYPE_MAP = {
+      image: "android.widget.ImageView",
+      button: "android.widget.Button",
+      text: "android.widget.TextView",
+      input: "android.widget.EditText",
+      view: "android.view.View",
+    };
+
+    function parentKeyOf(key) {
+      if (!key || key.indexOf("-") < 0) return "";
+      return key.split("-").slice(0, -1).join("-");
+    }
+
+    function boolLike(v) {
+      if (typeof v === "boolean") return v;
+      if (typeof v === "string") {
+        const s = v.trim().toLowerCase();
+        if (s === "true") return true;
+        if (s === "false") return false;
+      }
+      return null;
+    }
+
+    function escapeRegex(s) {
+      return String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    }
+
+    function isDynamicText(s) {
+      if (!s) return false;
+      if (s.length > 50) return true;
+      return (
+        /\d{2}:\d{2}(:\d{2})?/.test(s) ||
+        /\d{4}[-/]\d{1,2}[-/]\d{1,2}/.test(s) ||
+        /\b\d{6,}\b/.test(s)
+      );
+    }
+
+    function normalizeNode(node) {
+      const props = node && node.properties ? node.properties : {};
+      const className = props["className"] || props["class"] || node.name || "";
+      const uiType = SEMANTIC_TYPE_MAP[className] || null;
+      const normalized = {
+        key: node.key,
+        parentKey: parentKeyOf(node.key),
+        description: props["content-desc"] || props["description"] || props["contentDescription"] || "",
+        text: props["text"] || "",
+        resource_id: props["resource-id"] || props["resourceId"] || "",
+        ui_type: uiType,
+        class_name: className,
+        original: node,
+      };
+      for (const sk of STATE_KEYS) {
+        if (Object.prototype.hasOwnProperty.call(props, sk)) {
+          const bv = boolLike(props[sk]);
+          if (bv !== null) {
+            normalized[sk] = bv;
+          }
+        }
+      }
+      return normalized;
+    }
+
+    function toSemanticUiType(raw) {
+      if (!raw) return null;
+      if (REVERSE_SEMANTIC_TYPE_MAP[raw]) return raw;
+      return SEMANTIC_TYPE_MAP[raw] || null;
+    }
+
+    function matchValue(actual, expected) {
+      return String(actual) === String(expected);
+    }
+
+    function matchesSimpleSelector(n, selectorParams) {
+      if (!selectorParams) return false;
+      for (const k of Object.keys(selectorParams)) {
+        if (LEGACY_KEYS.has(k)) {
+          return false;
+        }
+      }
+
+      if (selectorParams.description !== undefined && !matchValue(n.description, selectorParams.description)) {
+        return false;
+      }
+      if (selectorParams.text !== undefined && !matchValue(n.text, selectorParams.text)) {
+        return false;
+      }
+      if (selectorParams.resource_id !== undefined && !matchValue(n.resource_id, selectorParams.resource_id)) {
+        return false;
+      }
+      if (selectorParams.ui_type !== undefined) {
+        const t = toSemanticUiType(selectorParams.ui_type);
+        if (!t) return false;
+        const expectedClass = REVERSE_SEMANTIC_TYPE_MAP[t];
+        if (expectedClass && n.class_name !== expectedClass) return false;
+        if (n.ui_type && n.ui_type !== t) return false;
+      }
+
+      if (selectorParams.text_contains !== undefined) {
+        if (!String(n.text || "").includes(String(selectorParams.text_contains))) return false;
+      }
+      if (selectorParams.description_contains !== undefined) {
+        if (!String(n.description || "").includes(String(selectorParams.description_contains))) return false;
+      }
+      if (selectorParams.text_matches !== undefined) {
+        const re = new RegExp(selectorParams.text_matches);
+        if (!re.test(String(n.text || ""))) return false;
+      }
+      if (selectorParams.description_matches !== undefined) {
+        const re = new RegExp(selectorParams.description_matches);
+        if (!re.test(String(n.description || ""))) return false;
+      }
+      if (selectorParams.text_starts_with !== undefined) {
+        if (!String(n.text || "").startsWith(String(selectorParams.text_starts_with))) return false;
+      }
+      if (selectorParams.description_starts_with !== undefined) {
+        if (!String(n.description || "").startsWith(String(selectorParams.description_starts_with))) return false;
+      }
+
+      for (const sk of STATE_KEYS) {
+        if (selectorParams[sk] !== undefined) {
+          if (n[sk] !== Boolean(selectorParams[sk])) return false;
+        }
+      }
+      return true;
+    }
+
+    function nodeDebugId(n) {
+      if (!n) return "unknown";
+      const rid = n.resource_id || "";
+      const desc = n.description || "";
+      return rid || desc || n.key || "unknown";
+    }
+
+    function applyInstance(list, instance) {
+      if (instance === undefined || instance === null) return list;
+      const idx = Number(instance);
+      if (!Number.isInteger(idx) || idx < 0 || idx >= list.length) return [];
+      return [list[idx]];
+    }
+
+    function checkUniqueness(selector, allNodes) {
+      if (!Array.isArray(selector) || selector.length !== 2 || selector[0] !== "u2_selector") {
+        return { unique: false, count: 0, matched: [] };
+      }
+      const params = selector[1] || {};
+      for (const k of Object.keys(params)) {
+        if (LEGACY_KEYS.has(k)) {
+          return { unique: false, count: 0, matched: [] };
+        }
+      }
+
+      const normalizedAll = allNodes.map(normalizeNode);
+      const baseParams = { ...params };
+      const siblingParams = baseParams.sibling;
+      const childParams = baseParams.child;
+      delete baseParams.sibling;
+      delete baseParams.child;
+      const instance = baseParams.instance;
+      delete baseParams.instance;
+
+      let matched = normalizedAll.filter((n) => matchesSimpleSelector(n, baseParams));
+
+      if (siblingParams) {
+        const siblingInstance = siblingParams.instance;
+        const siblingBase = { ...siblingParams };
+        delete siblingBase.instance;
+        const resolved = [];
+        for (const anchor of matched) {
+          const sameLevel = normalizedAll.filter((n) => n.parentKey === anchor.parentKey);
+          const siblings = sameLevel.filter((n) => matchesSimpleSelector(n, siblingBase));
+          const parentId = anchor.parentKey || "(root)";
+          console.log("Anchor Found:", nodeDebugId(anchor));
+          console.log("Parent Found:", parentId);
+          console.log("Total Siblings:", sameLevel.length);
+          console.log("Filtered Siblings (by ui_type):", siblings.length);
+          console.log("Target Instance:", siblingInstance ?? 0);
+          const picked = applyInstance(siblings, siblingInstance);
+          resolved.push(...picked);
+        }
+        matched = resolved;
+      }
+
+      if (childParams) {
+        const childInstance = childParams.instance;
+        const childBase = { ...childParams };
+        delete childBase.instance;
+        const resolved = [];
+        for (const parent of matched) {
+          const children = normalizedAll
+            .filter((n) => n.parentKey === parent.key)
+            .filter((n) => matchesSimpleSelector(n, childBase));
+          const picked = applyInstance(children, childInstance);
+          resolved.push(...picked);
+        }
+        matched = resolved;
+      }
+
+      matched = applyInstance(matched, instance);
+      return { unique: matched.length === 1, count: matched.length, matched };
+    }
+
+    function indexAmong(nodes, predicate, targetKey) {
+      const list = nodes.filter(predicate);
+      return list.findIndex((n) => n.key === targetKey);
+    }
+
+    function makeSelector(params) {
+      return ["u2_selector", params];
+    }
+
+    function findUniqueSelector(targetNode, allNodes) {
+      if (!targetNode || !Array.isArray(allNodes) || allNodes.length === 0) {
+        return makeSelector({ ui_type: "view", instance: 0 });
+      }
+      const target = normalizeNode(targetNode);
+      const normalizedAll = allNodes.map(normalizeNode);
+
+      const isUnique = (params) => checkUniqueness(makeSelector(params), allNodes).unique;
+
+      // A) 独占属性直连：description -> resource_id -> text
+      if (target.description && isUnique({ description: target.description })) {
+        return makeSelector({ description: target.description });
+      }
+      if (target.resource_id && isUnique({ resource_id: target.resource_id })) {
+        return makeSelector({ resource_id: target.resource_id });
+      }
+      if (target.text && isUnique({ text: target.text })) {
+        return makeSelector({ text: target.text });
+      }
+
+      // 仅在超长/动态文本时尝试模糊匹配
+      if (target.text && isDynamicText(target.text)) {
+        const core = target.text.replace(/\d+/g, "").trim();
+        const containsValue = core.length >= 3 ? core.slice(0, 20) : target.text.slice(0, 20);
+        if (containsValue && isUnique({ text_contains: containsValue })) {
+          return makeSelector({ text_contains: containsValue });
+        }
+        const regex = escapeRegex(target.text).replace(/\d+/g, "\\d+");
+        if (regex && isUnique({ text_matches: regex })) {
+          return makeSelector({ text_matches: regex });
+        }
+      }
+      if (target.description && isDynamicText(target.description)) {
+        const core = target.description.replace(/\d+/g, "").trim();
+        const containsValue = core.length >= 3 ? core.slice(0, 20) : target.description.slice(0, 20);
+        if (containsValue && isUnique({ description_contains: containsValue })) {
+          return makeSelector({ description_contains: containsValue });
+        }
+        const regex = escapeRegex(target.description).replace(/\d+/g, "\\d+");
+        if (regex && isUnique({ description_matches: regex })) {
+          return makeSelector({ description_matches: regex });
+        }
+      }
+
+      // B) 属性组合：ui_type + (description|text|resource_id) + 状态属性
+      const comboAttrs = [];
+      if (target.description) comboAttrs.push({ description: target.description });
+      if (target.resource_id) comboAttrs.push({ resource_id: target.resource_id });
+      if (target.text) comboAttrs.push({ text: target.text });
+
+      const targetStates = {};
+      for (const sk of STATE_KEYS) {
+        if (target[sk] !== undefined) targetStates[sk] = target[sk];
+      }
+
+      if (target.ui_type) {
+        for (const a of comboAttrs) {
+          const base = { ui_type: target.ui_type, ...a };
+          if (isUnique(base)) return makeSelector(base);
+
+          const preferredStates = ["clickable", "enabled"];
+          for (const sk of preferredStates) {
+            if (targetStates[sk] !== undefined) {
+              const withState = { ...base, [sk]: targetStates[sk] };
+              if (isUnique(withState)) return makeSelector(withState);
+            }
+          }
+        }
+      }
+
+      // C1) sibling 层级定位：用兄弟唯一锚点 + sibling 条件
+      const siblings = normalizedAll.filter(
+        (n) => n.parentKey === target.parentKey && n.key !== target.key
+      );
+      const sameLevelNodes = normalizedAll.filter((n) => n.parentKey === target.parentKey);
+      const targetAbsIndex = sameLevelNodes.findIndex((n) => n.key === target.key); // 0-based
+      const filteredByType = target.ui_type
+        ? sameLevelNodes.filter((n) => matchesSimpleSelector(n, { ui_type: target.ui_type }))
+        : [];
+      const targetTypeIndex = target.ui_type
+        ? filteredByType.findIndex((n) => n.key === target.key) // 0-based
+        : -1;
+
+      // 当 ui_type 为泛化 view 且不能明显缩小候选时，退化为绝对 sibling instance
+      const shouldDropUiType =
+        target.ui_type === "view" &&
+        filteredByType.length > 0 &&
+        filteredByType.length >= sameLevelNodes.length - 1;
+
+      for (const s of siblings) {
+        const anchorCandidates = [];
+        if (s.description) anchorCandidates.push({ description: s.description });
+        if (s.resource_id) anchorCandidates.push({ resource_id: s.resource_id });
+        if (s.text) anchorCandidates.push({ text: s.text });
+        for (const anchor of anchorCandidates) {
+          if (!isUnique(anchor)) continue;
+
+          const anchorIndex = sameLevelNodes.findIndex((n) => n.key === s.key); // 0-based
+          const siblingTypeNames = sameLevelNodes.map((c) => c.ui_type || "unknown");
+          const filteredIndexes = filteredByType.map((c) => sameLevelNodes.findIndex((n) => n.key === c.key));
+          const calculatedInstance = shouldDropUiType
+            ? Math.max(0, targetAbsIndex)
+            : Math.max(0, targetTypeIndex >= 0 ? targetTypeIndex : targetAbsIndex);
+
+          // 调试日志（按需求输出）
+          console.log("Anchor Index:", anchorIndex);
+          console.log("Target Index:", targetAbsIndex);
+          console.log("Siblings List:", siblingTypeNames);
+          console.log("Filtered List (view):", filteredIndexes);
+          console.log("Calculated Instance:", calculatedInstance);
+
+          const siblingTargetSpec = shouldDropUiType
+            ? { instance: calculatedInstance }
+            : { ...(target.ui_type ? { ui_type: target.ui_type } : {}), instance: calculatedInstance };
+          const candidate = { ...anchor, sibling: siblingTargetSpec };
+          if (isUnique(candidate)) return makeSelector(candidate);
+        }
+      }
+
+      // C2) child 层级定位：唯一父 + child 条件
+      const parent = normalizedAll.find((n) => n.key === target.parentKey);
+      if (parent) {
+        const parentCandidates = [];
+        if (parent.description) parentCandidates.push({ description: parent.description });
+        if (parent.resource_id) parentCandidates.push({ resource_id: parent.resource_id });
+        if (parent.text) parentCandidates.push({ text: parent.text });
+
+        const childBase = {};
+        if (target.ui_type) childBase.ui_type = target.ui_type;
+        if (target.text) childBase.text = target.text;
+        if (!target.text && target.resource_id) childBase.resource_id = target.resource_id;
+
+        const parentChildren = normalizedAll
+          .filter((n) => n.parentKey === parent.key)
+          .filter((n) => matchesSimpleSelector(n, childBase));
+        const childInstance = indexAmong(parentChildren, () => true, target.key);
+
+        for (const pc of parentCandidates) {
+          if (!isUnique(pc)) continue;
+          const child = { ...childBase };
+          if (childInstance >= 0) child.instance = childInstance;
+          const candidate = { ...pc, child };
+          if (isUnique(candidate)) return makeSelector(candidate);
+        }
+      }
+
+      // D) fallback: ui_type + instance
+      const fallbackType = target.ui_type || "view";
+      const allSameType = normalizedAll.filter((n) => n.ui_type === fallbackType);
+      const instance = allSameType.findIndex((n) => n.key === target.key);
+      return makeSelector({ ui_type: fallbackType, instance: Math.max(0, instance) });
+    }
+
+    function generateU2Selector(targetNode, allNodes) {
+      return findUniqueSelector(targetNode, allNodes);
+    }
+
+    function runU2SelectorMatch(selectorParams, allNodes) {
+      const normalizedAll = allNodes.map(normalizeNode);
+      const baseParams = { ...(selectorParams || {}) };
+      const siblingParams = baseParams.sibling;
+      const childParams = baseParams.child;
+      delete baseParams.sibling;
+      delete baseParams.child;
+      const instance = baseParams.instance;
+      delete baseParams.instance;
+
+      let matched = normalizedAll.filter((n) => matchesSimpleSelector(n, baseParams));
+
+      if (siblingParams) {
+        const siblingInstance = siblingParams.instance;
+        const siblingBase = { ...siblingParams };
+        delete siblingBase.instance;
+        const resolved = [];
+        for (const anchor of matched) {
+          const sameLevel = normalizedAll.filter((n) => n.parentKey === anchor.parentKey);
+          const siblings = sameLevel.filter((n) => matchesSimpleSelector(n, siblingBase));
+          const parentId = anchor.parentKey || "(root)";
+          console.log("Anchor Found:", nodeDebugId(anchor));
+          console.log("Parent Found:", parentId);
+          console.log("Total Siblings:", sameLevel.length);
+          console.log("Filtered Siblings (by ui_type):", siblings.length);
+          console.log("Target Instance:", siblingInstance ?? 0);
+          resolved.push(...applyInstance(siblings, siblingInstance));
+        }
+        matched = resolved;
+      }
+
+      if (childParams) {
+        const childInstance = childParams.instance;
+        const childBase = { ...childParams };
+        delete childBase.instance;
+        const resolved = [];
+        for (const parent of matched) {
+          const children = normalizedAll
+            .filter((n) => n.parentKey === parent.key)
+            .filter((n) => matchesSimpleSelector(n, childBase));
+          resolved.push(...applyInstance(children, childInstance));
+        }
+        matched = resolved;
+      }
+
+      matched = applyInstance(matched, instance);
+      return matched.map((n) => n.original);
+    }
+
+    function SearchIcon({ className = "h-4 w-4" }) {
+      return (
+        <svg
+          xmlns="http://www.w3.org/2000/svg"
+          fill="none"
+          viewBox="0 0 24 24"
+          strokeWidth={1.8}
+          stroke="currentColor"
+          className={className}
+        >
+          <path strokeLinecap="round" strokeLinejoin="round" d="m21 21-4.35-4.35m1.35-5.15a6.5 6.5 0 1 1-13 0 6.5 6.5 0 0 1 13 0Z" />
+        </svg>
+      );
+    }
+
+    function flattenNodes(node, list) {
+      if (!node) return;
+      if (node.rect && typeof node.rect.x === "number") {
+        list.push(node);
+      }
+      const children = Array.isArray(node.children) ? node.children : [];
+      for (const child of children) flattenNodes(child, list);
+    }
+
+    function TreeNode({ node, collapsed, toggleCollapsed, onSelect, selectedKey }) {
+      const children = Array.isArray(node.children) ? node.children : [];
+      const hasChildren = children.length > 0;
+      const isCollapsed = collapsed.has(node.key);
+      const isSelected = selectedKey === node.key;
+      const text = node.properties && node.properties.text ? ` text="${node.properties.text}"` : "";
+
+      return (
+        <div className="ml-3 text-xs leading-6">
+          <div
+            className={`flex cursor-pointer select-none items-center rounded px-1 ${
+              isSelected ? "bg-blue-100 text-blue-800" : "hover:bg-slate-100"
+            }`}
+            onClick={() => onSelect(node)}
+          >
+            <span
+              className="mr-1 inline-block w-3 text-slate-500"
+              onClick={(e) => {
+                e.stopPropagation();
+                if (hasChildren) toggleCollapsed(node.key);
+              }}
+            >
+              {hasChildren ? (isCollapsed ? "▶" : "▼") : "•"}
+            </span>
+            <span>{`<${node.name}>${text}`}</span>
+          </div>
+          {hasChildren && !isCollapsed && (
+            <div>
+              {children.map((child) => (
+                <TreeNode
+                  key={child.key}
+                  node={child}
+                  collapsed={collapsed}
+                  toggleCollapsed={toggleCollapsed}
+                  onSelect={onSelect}
+                  selectedKey={selectedKey}
+                />
+              ))}
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    function App() {
+      const gridRef = useRef(null);
+      const mirrorRef = useRef(null);
+      const imageRef = useRef(null);
+      const canvasRef = useRef(null);
+      const hitRectsRef = useRef([]);
+      const intervalRef = useRef(null);
+      const draggingRef = useRef(null);
+
+      const [leftPct, setLeftPct] = useState(40);
+      const [midPct, setMidPct] = useState(30);
+      const rightPct = useMemo(() => 100 - leftPct - midPct, [leftPct, midPct]);
+
+      const [devices, setDevices] = useState([]);
+      const [serial, setSerial] = useState("");
+      const [hierarchy, setHierarchy] = useState(null);
+      const [flatNodes, setFlatNodes] = useState([]);
+      const [allNodes, setAllNodes] = useState([]);
+      const [xmlSource, setXmlSource] = useState("");
+      const [collapsed, setCollapsed] = useState(new Set());
+      const [selectedNode, setSelectedNode] = useState(null);
+      const [hoverNode, setHoverNode] = useState(null);
+      const [validatedNode, setValidatedNode] = useState(null);
+      const [status, setStatus] = useState("初始化中");
+      const [logs, setLogs] = useState(["> Ready."]);
+
+      const [imageUrl, setImageUrl] = useState("");
+      const [imageMeta, setImageMeta] = useState({ width: 0, height: 0 });
+      const [mirrorSize, setMirrorSize] = useState({ width: 0, height: 0 });
+      const [isSearchOpen, setIsSearchOpen] = useState(false);
+      const [searchStrategy, setSearchStrategy] = useState("XPath");
+      const [searchSelector, setSearchSelector] = useState("");
+      const [searchResults, setSearchResults] = useState([]);
+      const [searchError, setSearchError] = useState("");
+
+      const appendLog = useCallback((msg) => {
+        setLogs((prev) => [...prev, `> ${msg}`].slice(-200));
+      }, []);
+
+      const selectedSelector = useMemo(
+        () => (selectedNode ? generateU2Selector(selectedNode, allNodes) : null),
+        [allNodes, selectedNode]
+      );
+
+      const nodeIndex = useMemo(() => {
+        const byKey = new Map();
+        const signatureMap = new Map();
+        for (const n of allNodes) {
+          byKey.set(n.key, n);
+          const props = n.properties || {};
+          const sig = [
+            props["class"] || "",
+            props["resource-id"] || "",
+            props["content-desc"] || "",
+            props["text"] || "",
+            props["bounds"] || "",
+          ].join("||");
+          if (!signatureMap.has(sig)) signatureMap.set(sig, []);
+          signatureMap.get(sig).push(n);
+        }
+        return { byKey, signatureMap };
+      }, [allNodes]);
+
+      const fetchJson = useCallback(async (url) => {
+        const resp = await fetch(url);
+        if (!resp.ok) {
+          const text = await resp.text();
+          throw new Error(`${resp.status} ${text}`);
+        }
+        return await resp.json();
+      }, []);
+
+      const fetchText = useCallback(async (url) => {
+        const resp = await fetch(url);
+        if (!resp.ok) {
+          const text = await resp.text();
+          throw new Error(`${resp.status} ${text}`);
+        }
+        return await resp.text();
+      }, []);
+
+      const loadDevices = useCallback(async () => {
+        setStatus("加载设备列表...");
+        const list = await fetchJson("/api/android/list");
+        setDevices(Array.isArray(list) ? list : []);
+        if (!Array.isArray(list) || list.length === 0) {
+          throw new Error("未发现 Android 设备");
+        }
+        const params = new URLSearchParams(window.location.search);
+        const serialFromQuery = params.get("serial");
+        const exists = list.some((d) => d.serial === serialFromQuery);
+        const current = exists ? serialFromQuery : list[0].serial;
+        setSerial(current);
+        setStatus(`设备: ${current}`);
+      }, [fetchJson]);
+
+      const refreshHierarchy = useCallback(async (currentSerial) => {
+        if (!currentSerial) return;
+        setStatus("刷新层级中...");
+        const [data, xml] = await Promise.all([
+          fetchJson(`/api/android/${encodeURIComponent(currentSerial)}/hierarchy?format=json`),
+          fetchText(`/api/android/${encodeURIComponent(currentSerial)}/hierarchy?format=xml`),
+        ]);
+        setHierarchy(data);
+        setXmlSource(xml);
+        const arr = [];
+        const all = [];
+        const walkAll = (n) => {
+          if (!n) return;
+          all.push(n);
+          const children = Array.isArray(n.children) ? n.children : [];
+          for (const c of children) walkAll(c);
+        };
+        walkAll(data);
+        flattenNodes(data, arr);
+        setFlatNodes(arr);
+        setAllNodes(all);
+        setStatus("层级已更新");
+        appendLog("hierarchy 刷新成功");
+      }, [appendLog, fetchJson, fetchText]);
+
+      const fetchScreenshot = useCallback(async (currentSerial) => {
+        if (!currentSerial) return;
+        const resp = await fetch(`/api/android/${encodeURIComponent(currentSerial)}/screenshot/0?t=${Date.now()}`);
+        if (!resp.ok) throw new Error(`截图失败 ${resp.status}`);
+        const blob = await resp.blob();
+        const next = URL.createObjectURL(blob);
+        setImageUrl((prev) => {
+          if (prev) URL.revokeObjectURL(prev);
+          return next;
+        });
+      }, []);
+
+      const redrawCanvas = useCallback(() => {
+        const canvas = canvasRef.current;
+        const mirror = mirrorRef.current;
+        if (!canvas || !mirror) return;
+
+        const dpr = window.devicePixelRatio || 1;
+        const cw = Math.max(1, Math.floor(mirror.clientWidth));
+        const ch = Math.max(1, Math.floor(mirror.clientHeight));
+
+        if (canvas.width !== Math.floor(cw * dpr) || canvas.height !== Math.floor(ch * dpr)) {
+          canvas.width = Math.floor(cw * dpr);
+          canvas.height = Math.floor(ch * dpr);
+        }
+        canvas.style.width = `${cw}px`;
+        canvas.style.height = `${ch}px`;
+
+        const ctx = canvas.getContext("2d");
+        ctx.setTransform(1, 0, 0, 1, 0, 0);
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        ctx.scale(dpr, dpr);
+
+        if (!imageMeta.width || !imageMeta.height) {
+          hitRectsRef.current = [];
+          return;
+        }
+
+        const fit = fitContain(cw, ch, imageMeta.width, imageMeta.height);
+
+        const rects = [];
+        for (const node of flatNodes) {
+          if (!node.rect) continue;
+          const x = fit.offsetX + node.rect.x * fit.scale;
+          const y = fit.offsetY + node.rect.y * fit.scale;
+          const w = node.rect.width * fit.scale;
+          const h = node.rect.height * fit.scale;
+          if (w < 1 || h < 1) continue;
+          rects.push({ node, x, y, w, h, area: w * h });
+        }
+        hitRectsRef.current = rects;
+
+        // 1) 初始化渲染：全量透明框
+        ctx.save();
+        ctx.lineWidth = 1;
+        ctx.strokeStyle = "rgba(0, 255, 170, 0.28)";
+        for (const r of rects) {
+          ctx.strokeRect(r.x, r.y, r.w, r.h);
+        }
+        ctx.restore();
+
+        // 2) Hover 蓝色反馈 + 标签
+        if (hoverNode) {
+          const hr = rects.find((r) => r.node.key === hoverNode.key);
+          if (hr) {
+            const label = (hoverNode.properties && hoverNode.properties.class) || hoverNode.name || "Node";
+            ctx.save();
+            ctx.fillStyle = "rgba(59, 130, 246, 0.25)";
+            ctx.strokeStyle = "rgba(59, 130, 246, 0.95)";
+            ctx.lineWidth = 2;
+            ctx.fillRect(hr.x, hr.y, hr.w, hr.h);
+            ctx.strokeRect(hr.x, hr.y, hr.w, hr.h);
+
+            ctx.font = "12px sans-serif";
+            const tw = Math.ceil(ctx.measureText(label).width);
+            const bx = Math.max(0, hr.x);
+            const by = Math.max(0, hr.y - 18);
+            ctx.fillStyle = "rgba(37, 99, 235, 0.95)";
+            ctx.fillRect(bx, by, tw + 10, 18);
+            ctx.fillStyle = "#fff";
+            ctx.fillText(label, bx + 5, by + 13);
+            ctx.restore();
+          }
+        }
+
+        // 3) 选中红框保持
+        if (selectedNode) {
+          const sr = rects.find((r) => r.node.key === selectedNode.key);
+          if (sr) {
+            ctx.save();
+            ctx.fillStyle = "rgba(239, 68, 68, 0.2)";
+            ctx.strokeStyle = "rgba(220, 38, 38, 0.95)";
+            ctx.lineWidth = 2;
+            ctx.fillRect(sr.x, sr.y, sr.w, sr.h);
+            ctx.strokeRect(sr.x, sr.y, sr.w, sr.h);
+            ctx.restore();
+          }
+        }
+
+        // Search 结果联动高亮（黄色/绿色）
+        if (validatedNode) {
+          const vr = rects.find((r) => r.node.key === validatedNode.key);
+          if (vr) {
+            ctx.save();
+            ctx.strokeStyle = "rgba(34, 197, 94, 0.95)";
+            ctx.fillStyle = "rgba(250, 204, 21, 0.22)";
+            ctx.lineWidth = 3;
+            ctx.fillRect(vr.x, vr.y, vr.w, vr.h);
+            ctx.strokeRect(vr.x, vr.y, vr.w, vr.h);
+            ctx.restore();
+          }
+        }
+      }, [flatNodes, hoverNode, imageMeta.height, imageMeta.width, selectedNode, validatedNode]);
+
+      const pickNodeAt = useCallback((clientX, clientY) => {
+        const mirror = mirrorRef.current;
+        if (!mirror) return null;
+        const rect = mirror.getBoundingClientRect();
+        const x = clientX - rect.left;
+        const y = clientY - rect.top;
+        const hits = hitRectsRef.current.filter((r) => x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h);
+        if (!hits.length) return null;
+        hits.sort((a, b) => a.area - b.area);
+        return hits[0].node;
+      }, []);
+
+      const onMouseMoveCanvas = useCallback((e) => {
+        const hit = pickNodeAt(e.clientX, e.clientY);
+        setHoverNode((prev) => (prev && hit && prev.key === hit.key) || (!prev && !hit) ? prev : hit);
+      }, [pickNodeAt]);
+
+      const onClickCanvas = useCallback((e) => {
+        const hit = pickNodeAt(e.clientX, e.clientY);
+        if (hit) {
+          setValidatedNode(null);
+          setSelectedNode(hit);
+          appendLog(`Canvas 选中: ${hit.name}(${hit.key})`);
+        }
+      }, [appendLog, pickNodeAt]);
+
+      const startStream = useCallback((currentSerial) => {
+        if (intervalRef.current) clearInterval(intervalRef.current);
+        intervalRef.current = null;
+        if (!currentSerial) return;
+        fetchScreenshot(currentSerial).catch((e) => appendLog(e.message));
+        intervalRef.current = setInterval(() => {
+          fetchScreenshot(currentSerial).catch((e) => appendLog(e.message));
+        }, 900);
+      }, [appendLog, fetchScreenshot]);
+
+      const manualRefresh = useCallback(async () => {
+        if (!serial) return;
+        setStatus("手动刷新中...");
+        await Promise.all([
+          refreshHierarchy(serial),
+          fetchScreenshot(serial),
+        ]);
+        setStatus("手动刷新完成");
+        appendLog("已手动刷新 XML 与镜像");
+      }, [appendLog, fetchScreenshot, refreshHierarchy, serial]);
+
+      const downloadXmlTree = useCallback(() => {
+        if (!xmlSource) {
+          appendLog("下载失败：当前没有可用 XML");
+          return;
+        }
+        const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+        const fileName = `xml_tree_${serial || "device"}_${timestamp}.xml`;
+        const blob = new Blob([xmlSource], { type: "application/xml;charset=utf-8" });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = fileName;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+        appendLog(`已下载 XML Tree: ${fileName}`);
+      }, [appendLog, serial, xmlSource]);
+
+      const mapDomElementToNode = useCallback((elem) => {
+        if (!elem || elem.nodeType !== 1) return null;
+        const sig = [
+          elem.getAttribute("class") || "",
+          elem.getAttribute("resource-id") || "",
+          elem.getAttribute("content-desc") || "",
+          elem.getAttribute("text") || "",
+          elem.getAttribute("bounds") || "",
+        ].join("||");
+        const candidates = nodeIndex.signatureMap.get(sig) || [];
+        return candidates.length ? candidates[0] : null;
+      }, [nodeIndex.signatureMap]);
+
+      const parseU2Input = useCallback((raw) => {
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed)) {
+          if (parsed[0] !== "u2_selector" || typeof parsed[1] !== "object" || parsed[1] === null) {
+            throw new Error("Invalid Selector Syntax");
+          }
+          return parsed[1];
+        }
+        if (typeof parsed === "object" && parsed !== null) {
+          return parsed;
+        }
+        throw new Error("Invalid Selector Syntax");
+      }, []);
+
+      const handleSearch = useCallback((strategy, selector) => {
+        const query = String(selector || "").trim();
+        setSearchError("");
+        setSearchResults([]);
+        if (!query) {
+          setSearchError("Invalid Selector Syntax");
+          return;
+        }
+        if (!allNodes.length) {
+          setSearchError("NoSuchElement: No elements found using this selector");
+          return;
+        }
+
+        try {
+          let matched = [];
+          if (strategy === "XPath") {
+            if (!xmlSource) throw new Error("Invalid Selector Syntax");
+            let xmlDoc;
+            try {
+              xmlDoc = new DOMParser().parseFromString(xmlSource, "application/xml");
+            } catch (_) {
+              throw new Error("Invalid Selector Syntax");
+            }
+            const parseErr = xmlDoc.getElementsByTagName("parsererror");
+            if (parseErr && parseErr.length > 0) {
+              throw new Error("Invalid Selector Syntax");
+            }
+            let snapshot;
+            try {
+              snapshot = xmlDoc.evaluate(query, xmlDoc, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
+            } catch (_) {
+              throw new Error("Invalid Selector Syntax");
+            }
+            const results = [];
+            for (let i = 0; i < snapshot.snapshotLength; i += 1) {
+              const elem = snapshot.snapshotItem(i);
+              const node = mapDomElementToNode(elem);
+              if (node) results.push(node);
+            }
+            matched = results;
+          } else if (strategy === "ID") {
+            matched = allNodes.filter((n) => (n.properties && n.properties["resource-id"]) === query);
+          } else if (strategy === "Accessibility ID") {
+            matched = allNodes.filter((n) => (n.properties && n.properties["content-desc"]) === query);
+          } else if (strategy === "Class Name") {
+            matched = allNodes.filter((n) => (n.properties && n.properties["class"]) === query);
+          } else if (strategy === "u2_selector") {
+            const params = parseU2Input(query);
+            matched = runU2SelectorMatch(params, allNodes);
+          } else {
+            throw new Error("Invalid Selector Syntax");
+          }
+
+          if (!matched.length) {
+            setSearchError("NoSuchElement: No elements found using this selector");
+            return;
+          }
+          setSearchResults(matched);
+          appendLog(`Found ${matched.length} elements`);
+        } catch (e) {
+          if (String(e.message || "").includes("Invalid Selector Syntax")) {
+            setSearchError("Invalid Selector Syntax");
+          } else {
+            setSearchError("Invalid Selector Syntax");
+          }
+        }
+      }, [allNodes, appendLog, mapDomElementToNode, parseU2Input, xmlSource]);
+
+      const onPickSearchResult = useCallback((node) => {
+        setValidatedNode(node);
+        setSelectedNode(node);
+        setIsSearchOpen(false);
+        appendLog(`Search 命中: ${node.name}(${node.key})`);
+      }, [appendLog]);
+
+      // 初始化
+      useEffect(() => {
+        let mounted = true;
+        (async () => {
+          try {
+            await loadDevices();
+          } catch (e) {
+            if (mounted) {
+              setStatus("初始化失败");
+              appendLog(`初始化失败: ${e.message}`);
+            }
+          }
+        })();
+        return () => {
+          mounted = false;
+        };
+      }, [appendLog, loadDevices]);
+
+      // serial 改变时刷新数据和截图流
+      useEffect(() => {
+        if (!serial) return;
+        refreshHierarchy(serial).catch((e) => appendLog(`层级刷新失败: ${e.message}`));
+        startStream(serial);
+      }, [appendLog, refreshHierarchy, serial, startStream]);
+
+      // image 加载后记录原图尺寸
+      useEffect(() => {
+        const img = imageRef.current;
+        if (!img) return;
+        const onLoad = () => {
+          setImageMeta({ width: img.naturalWidth, height: img.naturalHeight });
+        };
+        img.addEventListener("load", onLoad);
+        return () => img.removeEventListener("load", onLoad);
+      }, [imageUrl]);
+
+      // 监听左栏尺寸变化，确保缩放重绘
+      useEffect(() => {
+        const mirror = mirrorRef.current;
+        if (!mirror) return;
+        const ro = new ResizeObserver((entries) => {
+          for (const entry of entries) {
+            const w = Math.floor(entry.contentRect.width);
+            const h = Math.floor(entry.contentRect.height);
+            setMirrorSize({ width: w, height: h });
+          }
+        });
+        ro.observe(mirror);
+        return () => ro.disconnect();
+      }, []);
+
+      useEffect(() => {
+        redrawCanvas();
+      }, [redrawCanvas, imageUrl, mirrorSize.width, mirrorSize.height]);
+
+      useEffect(() => {
+        const onMove = (e) => {
+          if (!draggingRef.current || !gridRef.current) return;
+          const rect = gridRef.current.getBoundingClientRect();
+          const pct = ((e.clientX - rect.left) / rect.width) * 100;
+          const rightMin = MIN_PCT;
+          if (draggingRef.current === "left") {
+            const nextLeft = clamp(pct, MIN_PCT, 100 - midPct - rightMin);
+            setLeftPct(nextLeft);
+          } else if (draggingRef.current === "mid") {
+            const rightEdgePct = leftPct + midPct;
+            const deltaPct = pct - leftPct;
+            const maxMid = 100 - leftPct - rightMin;
+            const nextMid = clamp(deltaPct, MIN_PCT, maxMid);
+            if (rightEdgePct > leftPct) {
+              setMidPct(nextMid);
+            }
+          }
+        };
+
+        const onUp = () => {
+          draggingRef.current = null;
+          document.body.style.cursor = "";
+          document.body.style.userSelect = "";
+        };
+
+        window.addEventListener("mousemove", onMove);
+        window.addEventListener("mouseup", onUp);
+        return () => {
+          window.removeEventListener("mousemove", onMove);
+          window.removeEventListener("mouseup", onUp);
+        };
+      }, [leftPct, midPct]);
+
+      useEffect(() => {
+        return () => {
+          if (intervalRef.current) clearInterval(intervalRef.current);
+          if (imageUrl) URL.revokeObjectURL(imageUrl);
+        };
+      }, [imageUrl]);
+
+      const toggleCollapsed = (key) => {
+        setCollapsed((prev) => {
+          const next = new Set(prev);
+          if (next.has(key)) next.delete(key);
+          else next.add(key);
+          return next;
+        });
+      };
+
+      const onSelectTreeNode = (node) => {
+        setValidatedNode(null);
+        setSelectedNode(node);
+        appendLog(`树选中: ${node.name}(${node.key})`);
+      };
+
+      const startDrag = (type) => {
+        draggingRef.current = type;
+        document.body.style.cursor = "col-resize";
+        document.body.style.userSelect = "none";
+      };
+
+      const copySelector = async () => {
+        if (!selectedSelector) return;
+        await navigator.clipboard.writeText(JSON.stringify(selectedSelector));
+        appendLog("已复制 u2_selector");
+      };
+
+      const selectedProps = selectedNode ? selectedNode.properties || {} : {};
+
+      return (
+        <div className="relative flex h-screen w-full flex-col overflow-hidden p-2">
+          <div className="mb-2 flex items-center justify-between rounded border border-slate-300 bg-white px-3 py-2">
+            <div className="text-sm font-semibold text-slate-700">Element Search Validator</div>
+            <button
+              className="inline-flex items-center gap-1 rounded bg-slate-800 px-3 py-1.5 text-sm text-white hover:bg-slate-700"
+              onClick={() => {
+                setSearchError("");
+                setSearchResults([]);
+                setIsSearchOpen(true);
+              }}
+            >
+              <SearchIcon className="h-4 w-4" />
+              Search
+            </button>
+          </div>
+          <div
+            ref={gridRef}
+            className="grid min-h-0 flex-1 w-full overflow-hidden rounded border border-slate-300 bg-white"
+            style={{
+              gridTemplateColumns: `${leftPct}% ${RESIZER_PX}px ${midPct}% ${RESIZER_PX}px ${rightPct}%`,
+            }}
+          >
+            {/* Left: Mirror */}
+            <section className="relative flex h-full min-h-0 min-w-0 items-center justify-center overflow-hidden bg-black" ref={mirrorRef}>
+              <img
+                ref={imageRef}
+                src={imageUrl}
+                alt="mirror"
+                className="absolute inset-0 m-auto max-h-full max-w-full object-contain"
+                draggable={false}
+              />
+              <canvas
+                ref={canvasRef}
+                className="absolute inset-0 m-auto max-h-full max-w-full object-contain"
+                onMouseMove={onMouseMoveCanvas}
+                onMouseLeave={() => setHoverNode(null)}
+                onClick={onClickCanvas}
+              />
+            </section>
+
+            {/* Resizer 1 */}
+            <div
+              className="h-full cursor-col-resize bg-slate-200 hover:bg-blue-300"
+              onMouseDown={() => startDrag("left")}
+              title="拖拽调整左侧宽度"
+            />
+
+            {/* Center: XML Tree */}
+            <section className="flex h-full min-h-0 min-w-0 flex-col overflow-hidden border-l border-r border-slate-200">
+              <div className="flex items-center gap-2 border-b border-slate-200 p-2">
+                <select
+                  className="flex-1 rounded border border-slate-300 px-2 py-1 text-sm"
+                  value={serial}
+                  onChange={(e) => setSerial(e.target.value)}
+                >
+                  {devices.map((d) => (
+                    <option key={d.serial} value={d.serial}>
+                      {d.serial}{d.model ? ` (${d.model})` : ""}
+                    </option>
+                  ))}
+                </select>
+                <button
+                  className="rounded bg-blue-600 px-3 py-1 text-sm text-white hover:bg-blue-700"
+                  onClick={() => manualRefresh().catch((e) => appendLog(e.message))}
+                >
+                  刷新
+                </button>
+                <button
+                  className="rounded bg-emerald-600 px-3 py-1 text-sm text-white hover:bg-emerald-700 disabled:bg-slate-400"
+                  onClick={downloadXmlTree}
+                  disabled={!xmlSource}
+                >
+                  下载 XML
+                </button>
+              </div>
+              <div className="flex items-center justify-between border-b border-slate-200 px-3 py-2">
+                <h2 className="text-sm font-semibold text-slate-700">XML Tree</h2>
+                <span className="text-xs text-slate-500">{status}</span>
+              </div>
+              <div className="min-h-0 flex-1 overflow-y-auto p-2">
+                {hierarchy ? (
+                  <TreeNode
+                    node={hierarchy}
+                    collapsed={collapsed}
+                    toggleCollapsed={toggleCollapsed}
+                    onSelect={onSelectTreeNode}
+                    selectedKey={selectedNode ? selectedNode.key : ""}
+                  />
+                ) : (
+                  <div className="text-sm text-slate-500">暂无层级数据</div>
+                )}
+              </div>
+            </section>
+
+            {/* Resizer 2 */}
+            <div
+              className="h-full cursor-col-resize bg-slate-200 hover:bg-blue-300"
+              onMouseDown={() => startDrag("mid")}
+              title="拖拽调整中间宽度"
+            />
+
+            {/* Right: Property/Code */}
+            <section className="flex h-full min-h-0 min-w-0 flex-col overflow-hidden bg-slate-50">
+              <div className="border-b border-slate-200 p-3">
+                <h3 className="text-sm font-semibold text-slate-700">属性列表</h3>
+              </div>
+              <div className="min-h-0 flex-1 overflow-auto p-3">
+                {selectedNode ? (
+                  <table className="w-full border-collapse text-xs">
+                    <tbody>
+                      <tr>
+                        <td className="w-32 border border-slate-200 bg-slate-100 px-2 py-1">key</td>
+                        <td className="border border-slate-200 px-2 py-1">{selectedNode.key}</td>
+                      </tr>
+                      <tr>
+                        <td className="border border-slate-200 bg-slate-100 px-2 py-1">name</td>
+                        <td className="border border-slate-200 px-2 py-1">{selectedNode.name}</td>
+                      </tr>
+                      {selectedNode.rect && (
+                        <tr>
+                          <td className="border border-slate-200 bg-slate-100 px-2 py-1">rect</td>
+                          <td className="border border-slate-200 px-2 py-1">{JSON.stringify(selectedNode.rect)}</td>
+                        </tr>
+                      )}
+                      {Object.entries(selectedProps).map(([k, v]) => (
+                        <tr key={k}>
+                          <td className="border border-slate-200 bg-slate-100 px-2 py-1">{k}</td>
+                          <td className="border border-slate-200 px-2 py-1">{String(v)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                ) : (
+                  <div className="text-sm text-slate-500">点击左侧 Canvas 或中间树节点后显示属性</div>
+                )}
+              </div>
+              <div className="border-t border-slate-200 p-3">
+                <h3 className="mb-2 text-sm font-semibold text-slate-700">u2_selector</h3>
+                <textarea
+                  className="h-24 w-full resize-none rounded border border-slate-300 p-2 font-mono text-xs"
+                  readOnly
+                  value={selectedSelector ? JSON.stringify(selectedSelector, null, 2) : ""}
+                  placeholder="自动生成定位语句"
+                />
+                <button
+                  className="mt-2 rounded bg-blue-600 px-3 py-1 text-sm text-white hover:bg-blue-700 disabled:bg-slate-400"
+                  onClick={copySelector}
+                  disabled={!selectedSelector}
+                >
+                  复制
+                </button>
+              </div>
+              <div className="min-h-28 border-t border-slate-200 bg-slate-900 p-3 font-mono text-xs text-slate-100">
+                <div className="mb-1 font-semibold text-slate-300">Console</div>
+                <div className="max-h-24 overflow-auto">
+                  {logs.map((line, idx) => (
+                    <div key={idx}>{line}</div>
+                  ))}
+                </div>
+              </div>
+            </section>
+          </div>
+
+          {isSearchOpen && (
+            <div className="absolute inset-0 z-50 flex items-center justify-center bg-black/35">
+              <div className="w-[760px] max-w-[95vw] rounded-xl bg-white shadow-2xl">
+                <div className="border-b border-slate-200 px-4 py-3 text-sm font-semibold text-slate-700">
+                  查找与验证 (Element Search Validator)
+                </div>
+                <div className="space-y-3 p-4">
+                  <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+                    <div>
+                      <label className="mb-1 block text-xs font-medium text-slate-600">Strategy</label>
+                      <select
+                        className="w-full rounded border border-slate-300 px-2 py-1.5 text-sm"
+                        value={searchStrategy}
+                        onChange={(e) => setSearchStrategy(e.target.value)}
+                      >
+                        <option>XPath</option>
+                        <option>ID</option>
+                        <option>Accessibility ID</option>
+                        <option>Class Name</option>
+                        <option>u2_selector</option>
+                      </select>
+                    </div>
+                    <div className="text-xs text-slate-500 md:self-end">
+                      支持 XPath / 属性查询 / u2_selector(JSON)
+                    </div>
+                  </div>
+
+                  <div>
+                    <label className="mb-1 block text-xs font-medium text-slate-600">Selector</label>
+                    <textarea
+                      className="h-28 w-full rounded border border-slate-300 p-2 font-mono text-xs"
+                      value={searchSelector}
+                      onChange={(e) => setSearchSelector(e.target.value)}
+                      placeholder='例如: //*[@text="确定"] 或 {"text":"确定"}'
+                    />
+                  </div>
+
+                  <div className="flex items-center gap-2">
+                    <button
+                      className="rounded bg-blue-600 px-3 py-1.5 text-sm text-white hover:bg-blue-700"
+                      onClick={() => handleSearch(searchStrategy, searchSelector)}
+                    >
+                      Search
+                    </button>
+                    <button
+                      className="rounded border border-slate-300 px-3 py-1.5 text-sm text-slate-700 hover:bg-slate-100"
+                      onClick={() => setIsSearchOpen(false)}
+                    >
+                      Cancel
+                    </button>
+                  </div>
+
+                  <div className="rounded border border-slate-200 bg-slate-50 p-3">
+                    {searchError ? (
+                      <div className="text-sm text-red-600">{searchError}</div>
+                    ) : (
+                      <div className="text-sm text-slate-700">
+                        {searchResults.length > 0 ? `Found ${searchResults.length} elements` : "等待搜索"}
+                      </div>
+                    )}
+                    <div className="mt-2 max-h-48 overflow-auto space-y-1">
+                      {searchResults.map((n) => {
+                        const props = n.properties || {};
+                        const snippet = `<node class="${props["class"] || ""}" bounds="${props["bounds"] || ""}" />`;
+                        return (
+                          <button
+                            key={`sr-${n.key}`}
+                            className="block w-full rounded border border-slate-200 bg-white px-2 py-1 text-left font-mono text-xs text-slate-700 hover:bg-emerald-50"
+                            onClick={() => onPickSearchResult(n)}
+                          >
+                            {snippet}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById("root"));
+    root.render(<App />);
+  </script>
+</body>
+</html>
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>UI Inspector - uiauto.dev</title>
+    <style>
+        :root {
+            --border-color: #ddd;
+            --bg-light: #f9f9f9;
+            --primary-color: #007bff;
+        }
+        body, html {
+            margin: 0; padding: 0; height: 100%; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+        }
+        .container {
+            display: flex;
+            height: 100vh;
+            overflow: hidden;
+        }
+        /* Left: Device Mirror */
+        .left-panel {
+            flex: 0 0 400px;
+            border-right: 1px solid var(--border-color);
+            display: flex;
+            flex-direction: column;
+            background: #111;
+        }
+        #device-canvas {
+            width: 100%;
+            height: 100%;
+            display: block;
+            cursor: crosshair;
+        }
+
+        /* Center: XML Tree */
+        .center-panel {
+            flex: 1;
+            border-right: 1px solid var(--border-color);
+            overflow-y: auto;
+            background: white;
+            padding: 10px;
+        }
+        .tree-node {
+            margin-left: 15px;
+            font-size: 13px;
+            line-height: 1.6;
+        }
+        .toolbar {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            margin-bottom: 10px;
+        }
+        .toolbar select {
+            flex: 1;
+            padding: 6px;
+            border: 1px solid var(--border-color);
+            border-radius: 4px;
+            background: #fff;
+        }
+        .tree-node-header {
+            cursor: pointer;
+            padding: 2px 5px;
+            border-radius: 3px;
+            user-select: none;
+        }
+        .tree-node-header:hover {
+            background: #eef;
+        }
+        .tree-node-header.selected {
+            background: #cce5ff;
+            font-weight: bold;
+        }
+        .toggle-btn {
+            display: inline-block;
+            width: 12px;
+            text-align: center;
+            margin-right: 5px;
+            color: #666;
+            cursor: pointer;
+        }
+        .status-text {
+            color: #666;
+            font-size: 12px;
+        }
+
+        /* Right: Properties & Tools */
+        .right-panel {
+            flex: 0 0 350px;
+            display: flex;
+            flex-direction: column;
+            background: var(--bg-light);
+            overflow-y: auto;
+        }
+        .panel-section {
+            padding: 15px;
+            border-bottom: 1px solid var(--border-color);
+        }
+        .panel-section h3 {
+            margin-top: 0;
+            font-size: 14px;
+            color: #333;
+            border-left: 3px solid var(--primary-color);
+            padding-left: 8px;
+        }
+        .prop-table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 12px;
+        }
+        .prop-table td {
+            padding: 4px;
+            border: 1px solid #eee;
+        }
+        .prop-key {
+            background: #f0f0f0;
+            width: 40%;
+            font-weight: 500;
+        }
+        .selector-box {
+            width: 100%;
+            box-sizing: border-box;
+            padding: 8px;
+            font-family: monospace;
+            font-size: 12px;
+            margin-bottom: 5px;
+        }
+        .btn {
+            padding: 6px 12px;
+            background: var(--primary-color);
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 12px;
+        }
+        .btn:hover { background: #0056b3; }
+        
+        #console-output {
+            background: #1e1e1e;
+            color: #d4d4d4;
+            font-family: 'Courier New', Courier, monospace;
+            font-size: 11px;
+            padding: 10px;
+            height: 150px;
+            overflow-y: auto;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <!-- Left: Mirror -->
+        <div class="left-panel">
+            <canvas id="device-canvas"></canvas>
+        </div>
+
+        <!-- Center: XML Tree -->
+        <div class="center-panel">
+            <div class="toolbar">
+                <select id="device-select"></select>
+                <button class="btn" onclick="refreshData()">刷新</button>
+            </div>
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
+                <h2 style="font-size: 16px; margin: 0;">Hierarchy</h2>
+                <span id="status-text" class="status-text">准备中</span>
+            </div>
+            <div id="xml-tree-root">正在加载数据...</div>
+        </div>
+
+        <!-- Right: Properties & Tools -->
+        <div class="right-panel">
+            <div class="panel-section">
+                <h3>属性面板</h3>
+                <div id="properties-content">选择一个元素查看属性</div>
+            </div>
+            <div class="panel-section">
+                <h3>定位语句生成</h3>
+                <textarea id="selector-output" class="selector-box" rows="3" readonly placeholder="XPath / ID / Selector"></textarea>
+                <button class="btn" onclick="copySelector()">复制</button>
+            </div>
+            <div class="panel-section" style="flex: 1;">
+                <h3>验证控制台</h3>
+                <div id="console-output">
+                    > Ready.
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const canvas = document.getElementById("device-canvas");
+        const ctx = canvas.getContext("2d");
+        const collapsedKeys = new Set();
+
+        let currentData = null;
+        let currentSerial = "";
+        let selectedNode = null;
+        let selectedNodeKey = "";
+        let hoverNode = null;
+        let hoverNodeKey = "";
+        let nodeHeaderMap = new Map();
+        let flatNodes = [];
+        let latestImage = null;
+        let screenshotTimer = null;
+        let screenshotLoading = false;
+
+        function setStatus(msg) {
+            document.getElementById("status-text").textContent = msg;
+        }
+
+        function normalizeBounds(node) {
+            if (node && node.rect && typeof node.rect.x === "number") {
+                return [
+                    node.rect.x,
+                    node.rect.y,
+                    node.rect.x + node.rect.width,
+                    node.rect.y + node.rect.height
+                ];
+            }
+            if (node && Array.isArray(node.bounds) && node.bounds.length === 4) {
+                return [
+                    Math.round(node.bounds[0] * canvas.width),
+                    Math.round(node.bounds[1] * canvas.height),
+                    Math.round(node.bounds[2] * canvas.width),
+                    Math.round(node.bounds[3] * canvas.height)
+                ];
+            }
+            return null;
+        }
+
+        function collectFlatNodes(node, list) {
+            if (!node) return;
+            const absBounds = normalizeBounds(node);
+            if (absBounds) {
+                list.push({ node, absBounds });
+            }
+            const children = Array.isArray(node.children) ? node.children : [];
+            for (const child of children) {
+                collectFlatNodes(child, list);
+            }
+        }
+
+        function drawCanvas() {
+            if (!latestImage) {
+                ctx.clearRect(0, 0, canvas.width, canvas.height);
+                return;
+            }
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            ctx.drawImage(latestImage, 0, 0, canvas.width, canvas.height);
+
+            // 1) 初始渲染：为所有元素绘制透明选框
+            ctx.save();
+            ctx.lineWidth = 1;
+            ctx.strokeStyle = "rgba(0, 255, 170, 0.25)";
+            for (const item of flatNodes) {
+                const b = item.absBounds;
+                const x = b[0];
+                const y = b[1];
+                const w = Math.max(1, b[2] - b[0]);
+                const h = Math.max(1, b[3] - b[1]);
+                ctx.strokeRect(x, y, w, h);
+            }
+            ctx.restore();
+
+            // 2) Hover 反馈：半透明蓝色 + 标签
+            if (hoverNode) {
+                const b = normalizeBounds(hoverNode);
+                if (b) {
+                    const x = b[0];
+                    const y = b[1];
+                    const w = Math.max(1, b[2] - b[0]);
+                    const h = Math.max(1, b[3] - b[1]);
+                    const label = getNodeLabel(hoverNode);
+
+                    ctx.save();
+                    ctx.fillStyle = "rgba(40, 121, 255, 0.24)";
+                    ctx.strokeStyle = "rgba(40, 121, 255, 0.95)";
+                    ctx.lineWidth = 2;
+                    ctx.fillRect(x, y, w, h);
+                    ctx.strokeRect(x, y, w, h);
+
+                    ctx.font = "12px sans-serif";
+                    const textWidth = Math.ceil(ctx.measureText(label).width);
+                    const boxW = textWidth + 10;
+                    const boxH = 18;
+                    const tx = Math.max(0, x);
+                    const ty = Math.max(0, y - boxH);
+                    ctx.fillStyle = "rgba(40, 121, 255, 0.95)";
+                    ctx.fillRect(tx, ty, boxW, boxH);
+                    ctx.fillStyle = "#fff";
+                    ctx.fillText(label, tx + 5, ty + 13);
+                    ctx.restore();
+                }
+            }
+
+            // 3) 点击选中：高亮红色保持
+            if (selectedNode) {
+                const b = normalizeBounds(selectedNode);
+                if (b) {
+                    const x = b[0];
+                    const y = b[1];
+                    const w = Math.max(1, b[2] - b[0]);
+                    const h = Math.max(1, b[3] - b[1]);
+                    ctx.save();
+                    ctx.fillStyle = "rgba(255, 0, 0, 0.18)";
+                    ctx.strokeStyle = "rgba(255, 0, 0, 0.95)";
+                    ctx.lineWidth = 2;
+                    ctx.fillRect(x, y, w, h);
+                    ctx.strokeRect(x, y, w, h);
+                    ctx.restore();
+                }
+            }
+        }
+
+        function getNodeLabel(node) {
+            const props = node.properties || {};
+            return (
+                props["class"] ||
+                node.name ||
+                "Node"
+            );
+        }
+
+        function generateU2Selector(node) {
+            const props = node.properties || {};
+            const rid = props["resource-id"] || props["id"] || "";
+            const text = props["text"] || "";
+            const desc = props["content-desc"] || props["contentDescription"] || "";
+            const cls = props["class"] || node.name || "*";
+
+            if (rid) {
+                return `resourceId("${rid}")\n//*[@resource-id="${rid}"]`;
+            }
+            if (desc) {
+                return `description("${desc}")\n//*[@content-desc="${desc}"]`;
+            }
+            if (text) {
+                return `text("${text}")\n//${cls}[@text="${text}"]`;
+            }
+            return `className("${cls}")\n//${cls}`;
+        }
+
+        function setSelectedHeaderByKey(key) {
+            document.querySelectorAll(".tree-node-header").forEach((el) => el.classList.remove("selected"));
+            const header = nodeHeaderMap.get(key);
+            if (header) {
+                header.classList.add("selected");
+                header.scrollIntoView({ block: "nearest" });
+            }
+        }
+
+        function selectNode(node, key, fromCanvas = false) {
+            selectedNode = node;
+            selectedNodeKey = key;
+            setSelectedHeaderByKey(key);
+
+            const propContent = document.getElementById("properties-content");
+            let html = '<table class="prop-table">';
+            html += `<tr><td class="prop-key">key</td><td>${node.key || ""}</td></tr>`;
+            html += `<tr><td class="prop-key">name</td><td>${node.name || ""}</td></tr>`;
+            if (node.rect) {
+                html += `<tr><td class="prop-key">rect</td><td>${JSON.stringify(node.rect)}</td></tr>`;
+            }
+            for (const [k, v] of Object.entries(node.properties || {})) {
+                html += `<tr><td class="prop-key">${k}</td><td>${String(v)}</td></tr>`;
+            }
+            html += "</table>";
+            propContent.innerHTML = html;
+
+            // 3.1 联动：填充属性并触发 selector 生成
+            document.getElementById("selector-output").value = generateU2Selector(node);
+            drawCanvas();
+            logConsole(`${fromCanvas ? "Canvas 命中" : "树选择"}: ${node.name}(${node.key})`);
+        }
+
+        function createNodeElement(node) {
+            const container = document.createElement("div");
+            container.className = "tree-node";
+
+            const header = document.createElement("div");
+            header.className = "tree-node-header";
+            header.dataset.key = node.key;
+
+            const children = Array.isArray(node.children) ? node.children : [];
+            const hasChildren = children.length > 0;
+            const collapsed = collapsedKeys.has(node.key);
+
+            const toggle = document.createElement("span");
+            toggle.className = "toggle-btn";
+            toggle.textContent = hasChildren ? (collapsed ? "▶" : "▼") : "•";
+            if (hasChildren) {
+                toggle.onclick = (e) => {
+                    e.stopPropagation();
+                    if (collapsedKeys.has(node.key)) {
+                        collapsedKeys.delete(node.key);
+                    } else {
+                        collapsedKeys.add(node.key);
+                    }
+                    renderTree(currentData);
+                };
+            }
+
+            const label = document.createElement("span");
+            const text = (node.properties && node.properties.text) ? ` text="${node.properties.text}"` : "";
+            label.textContent = `<${node.name}>${text}`;
+
+            header.appendChild(toggle);
+            header.appendChild(label);
+            header.onclick = (e) => {
+                e.stopPropagation();
+                selectNode(node, node.key, false);
+            };
+            nodeHeaderMap.set(node.key, header);
+            container.appendChild(header);
+
+            if (hasChildren && !collapsed) {
+                const childrenContainer = document.createElement("div");
+                for (const child of children) {
+                    childrenContainer.appendChild(createNodeElement(child));
+                }
+                container.appendChild(childrenContainer);
+            }
+            return container;
+        }
+
+        function renderTree(data) {
+            const root = document.getElementById('xml-tree-root');
+            nodeHeaderMap = new Map();
+            root.innerHTML = '';
+            root.appendChild(createNodeElement(data));
+            if (selectedNodeKey && nodeHeaderMap.has(selectedNodeKey)) {
+                setSelectedHeaderByKey(selectedNodeKey);
+            }
+        }
+
+        async function fetchJson(url) {
+            const resp = await fetch(url);
+            if (!resp.ok) {
+                const text = await resp.text();
+                throw new Error(`${resp.status} ${text}`);
+            }
+            return await resp.json();
+        }
+
+        async function loadDevices() {
+            const select = document.getElementById("device-select");
+            setStatus("加载设备列表...");
+            const devices = await fetchJson("/api/android/list");
+            select.innerHTML = "";
+            if (!Array.isArray(devices) || devices.length === 0) {
+                select.innerHTML = '<option value="">无可用设备</option>';
+                throw new Error("未发现 Android 设备");
+            }
+
+            for (const d of devices) {
+                const option = document.createElement("option");
+                option.value = d.serial;
+                option.textContent = `${d.serial}${d.model ? " (" + d.model + ")" : ""}`;
+                select.appendChild(option);
+            }
+
+            const params = new URLSearchParams(window.location.search);
+            const serialFromQuery = params.get("serial");
+            const exists = devices.some((d) => d.serial === serialFromQuery);
+            currentSerial = exists ? serialFromQuery : devices[0].serial;
+            select.value = currentSerial;
+
+            select.onchange = async () => {
+                currentSerial = select.value;
+                logConsole(`切换设备: ${currentSerial}`);
+                await refreshData();
+                startScreenshotStream();
+            };
+            setStatus(`设备: ${currentSerial}`);
+        }
+
+        async function refreshData() {
+            if (!currentSerial) return;
+            try {
+                setStatus(`刷新层级: ${currentSerial}`);
+                logConsole("正在获取 hierarchy...");
+                const data = await fetchJson(`/api/android/${encodeURIComponent(currentSerial)}/hierarchy?format=json`);
+                currentData = data;
+                flatNodes = [];
+                collectFlatNodes(currentData, flatNodes);
+                renderTree(currentData);
+
+                if (selectedNodeKey) {
+                    const hit = flatNodes.find((x) => x.node.key === selectedNodeKey);
+                    if (hit) {
+                        selectedNode = hit.node;
+                    } else {
+                        selectedNode = null;
+                        selectedNodeKey = "";
+                        document.getElementById("selector-output").value = "";
+                        document.getElementById("properties-content").innerHTML = "选择一个元素查看属性";
+                    }
+                }
+                await fetchAndDrawScreenshot();
+                drawCanvas();
+                setStatus(`已刷新: ${currentSerial}`);
+                logConsole("hierarchy + screenshot 刷新成功");
+            } catch (e) {
+                setStatus("层级刷新失败");
+                logConsole(`刷新失败: ${e.message}`);
+            }
+        }
+
+        async function fetchAndDrawScreenshot() {
+            if (!currentSerial || screenshotLoading) return;
+            screenshotLoading = true;
+            try {
+                const resp = await fetch(`/api/android/${encodeURIComponent(currentSerial)}/screenshot/0?t=${Date.now()}`);
+                if (!resp.ok) {
+                    throw new Error(`截图失败 ${resp.status}`);
+                }
+                const blob = await resp.blob();
+                const img = new Image();
+                img.onload = () => {
+                    latestImage = img;
+                    if (canvas.width !== img.width || canvas.height !== img.height) {
+                        canvas.width = img.width;
+                        canvas.height = img.height;
+                    }
+                    drawCanvas();
+                };
+                img.src = URL.createObjectURL(blob);
+            } catch (e) {
+                logConsole(`截图失败: ${e.message}`);
+            } finally {
+                screenshotLoading = false;
+            }
+        }
+
+        function startScreenshotStream() {
+            if (screenshotTimer) {
+                clearInterval(screenshotTimer);
+                screenshotTimer = null;
+            }
+            fetchAndDrawScreenshot();
+            screenshotTimer = setInterval(fetchAndDrawScreenshot, 800);
+            logConsole("截图流已启动");
+        }
+
+        function pickNodeByCanvasPoint(x, y) {
+            const hits = flatNodes.filter((item) => {
+                const b = item.absBounds;
+                return x >= b[0] && x <= b[2] && y >= b[1] && y <= b[3];
+            });
+            if (!hits.length) return null;
+            hits.sort((a, b) => {
+                const areaA = (a.absBounds[2] - a.absBounds[0]) * (a.absBounds[3] - a.absBounds[1]);
+                const areaB = (b.absBounds[2] - b.absBounds[0]) * (b.absBounds[3] - b.absBounds[1]);
+                return areaA - areaB;
+            });
+            return hits[0].node;
+        }
+
+        function logConsole(msg) {
+            const con = document.getElementById('console-output');
+            con.innerHTML += `<div>> ${msg}</div>`;
+            con.scrollTop = con.scrollHeight;
+        }
+
+        function copySelector() {
+            const text = document.getElementById("selector-output").value;
+            if (!text) return;
+            navigator.clipboard.writeText(text).then(() => {
+                logConsole("定位语句已复制到剪贴板");
+            });
+        }
+
+        canvas.addEventListener("click", (event) => {
+            if (!canvas.width || !canvas.height || flatNodes.length === 0) return;
+            const rect = canvas.getBoundingClientRect();
+            const x = (event.clientX - rect.left) * (canvas.width / rect.width);
+            const y = (event.clientY - rect.top) * (canvas.height / rect.height);
+            const hit = pickNodeByCanvasPoint(x, y);
+            if (hit) {
+                selectNode(hit, hit.key, true);
+            }
+        });
+
+        canvas.addEventListener("mousemove", (event) => {
+            if (!canvas.width || !canvas.height || flatNodes.length === 0) return;
+            const rect = canvas.getBoundingClientRect();
+            const x = (event.clientX - rect.left) * (canvas.width / rect.width);
+            const y = (event.clientY - rect.top) * (canvas.height / rect.height);
+            const hit = pickNodeByCanvasPoint(x, y);
+            const key = hit ? hit.key : "";
+            if (key !== hoverNodeKey) {
+                hoverNode = hit;
+                hoverNodeKey = key;
+                drawCanvas();
+            }
+        });
+
+        canvas.addEventListener("mouseleave", () => {
+            hoverNode = null;
+            hoverNodeKey = "";
+            drawCanvas();
+        });
+
+        async function init() {
+            try {
+                await loadDevices();
+                await refreshData();
+                startScreenshotStream();
+            } catch (e) {
+                setStatus("初始化失败");
+                logConsole(`初始化失败: ${e.message}`);
+            }
+        }
+
+        init();
+    </script>
+</body>
+</html>

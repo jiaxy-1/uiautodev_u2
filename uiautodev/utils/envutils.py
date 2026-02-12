@@ -7,3 +7,4 @@ def is_enabled(name: str) -> bool:
 
 class Environment:
     UIAUTODEV_MOCK = is_enabled("UIAUTODEV_MOCK")
+    UIAUTODEV_OFFLINE = is_enabled("UIAUTODEV_OFFLINE")

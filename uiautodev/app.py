@@ -127,6 +127,13 @@ def shutdown() -> str:
     return "Server shutting down..."
 
 
+@app.get("/inspector")
+def inspector():
+    """Inspector endpoint"""
+    static_dir = Path(__file__).parent / "static"
+    return FileResponse(static_dir / "inspector.html")
+
+
 @app.get("/demo")
 def demo():
     """Demo endpoint"""
